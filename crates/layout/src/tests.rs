@@ -3449,6 +3449,79 @@ fn a_word_too_wide_for_the_strip_beside_a_float_moves_on_whole() {
     }
 }
 
+/// #1158: text in an earlier column wraps around a shape anchored in a later column.
+#[test]
+fn earlier_column_wraps_around_shape_anchored_in_later_column() {
+    use wordcraft_doc::para::{Anchor, Float, ShapeKind, Wrap};
+    // Column 1 holds eight short lines; a column break sends the rest to column 2.
+    let mut d = Document::from_text(&("Column one line.\n".repeat(8) + "Column two starts here.\n" + &"More column two.\n".repeat(8)));
+    d.last_section.columns.count = 2;
+    let p = d.para_mut(StoryRef::Body, &Path::top(7)).unwrap();
+    let end = p.text.len();
+    p.insert_text(end, &wordcraft_doc::para::COLUMN_BREAK.to_string(), &Default::default()).unwrap();
+    // A square-wrapped shape anchored at the start of column 2 but sitting over column 1.
+    let shape = InlineObject::Shape {
+        kind: ShapeKind::Rectangle,
+        w: 100.0,
+        h: 80.0,
+        fill: None,
+        stroke: None,
+        stroke_width: 1.0,
+        float: Float { wrap: Wrap::Square, h_rel: Anchor::Margin, v_rel: Anchor::Paragraph, x: 0.0, y: 0.0, dist: 9.0, ..Default::default() },
+        story: None,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
+    };
+    d.insert_object(&Pos { story: StoryRef::Body, path: Path::top(8), off: 0 }, shape, &Default::default()).unwrap();
+    let l = lay(&d);
+    let body = l.pages[0].body;
+    let mid = body.x + body.w / 2.0;
+    // The anchor stayed in column 2 (the break pins it there).
+    let anchor_x = l.pages[0]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Placed::Lines { story: StoryRef::Body, path, x, .. } if *path == Path::top(8) => Some(*x),
+            _ => None,
+        })
+        .expect("anchor laid out");
+    assert!(anchor_x > mid, "anchor in column 2, at {anchor_x}");
+    // The shape sits over column 1.
+    let r = l.find_object(0, |o| o.text_box.is_none()).expect("shape").rect;
+    assert!(r.right() < mid, "shape over column 1: {r:?}");
+    // Column-1 lines overlapping it must not run through it: with the shape hugging the
+    // column's left edge only its right side has room, so they wrap there.
+    let mut narrowed = 0;
+    for it in &l.pages[0].items {
+        if let Placed::Lines { story: StoryRef::Body, para, l0, l1, x, y, .. } = it
+            && *x < mid
+        {
+            let first = &para.lines[*l0];
+            for li in *l0..*l1 {
+                let ln = &para.lines[li];
+                let (top, bottom) = (y + (ln.top - first.top), y + (ln.top - first.top) + ln.height);
+                if bottom > r.y && top < r.bottom() {
+                    let mut span: Option<(f32, f32)> = None;
+                    for k in ln.c0..ln.c1 {
+                        let Some(c) = para.clusters.get(k) else { continue };
+                        if c.kind == para::ClKind::Space {
+                            continue;
+                        }
+                        let (a, b) = (ln.xs.get(k - ln.c0).copied().unwrap_or(0.0), ln.xs.get(k - ln.c0).copied().unwrap_or(0.0) + c.adv);
+                        span = Some((span.map_or(a, |s: (f32, f32)| s.0.min(a)), span.map_or(b, |s| s.1.max(b))));
+                    }
+                    if let Some((a, b)) = span {
+                        assert!(!(x + a < r.right() - 0.5 && x + b > r.x + 0.5), "line must not run through the shape");
+                        narrowed += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(narrowed >= 2, "several column-1 lines overlap the shape");
+}
+
 /// Where a line's text ends (its last non-space cluster's right edge; trailing spaces may hang
 /// past the margin), relative to the column.
 fn ink_end(pl: &ParaLayout, ln: &para::Line) -> f32 {
