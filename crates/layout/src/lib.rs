@@ -1599,9 +1599,9 @@ struct PageBuilder<'a> {
     restart_at: Option<u32>,
     /// Wrap areas of floating objects on this page (see [`wrap_area`]).
     excl: Vec<WrapArea>,
-    /// Wrap zones pre-seeded for a page redo (#1158): the next `new_page` whose first block
-    /// matches lays the page out with these known from the start, then drops them (one-shot).
-    /// Empty in normal flow.
+    /// Wrap zones pre-seeded for a page redo (#1158), keyed by page index: the page at that
+    /// index lays out with them known from the start. A seed for a page not reached yet stays
+    /// for it; one whose page has passed is dropped. Empty in normal flow.
     seed: Option<(usize, Vec<WrapArea>)>,
     /// Wrap areas of the floating tables on this page, which others may not overlap.
     float_tables: Vec<Rect>,
@@ -2031,13 +2031,17 @@ impl PageBuilder<'_> {
         self.flush_notes();
         self.beneath = self.sect_beneath;
         self.excl.clear();
-        // A page redo's pre-seeded zones (#1158): this page lays out with them known from the
-        // start. One-shot: taken here whether or not this is the redone page, so a stale seed
-        // can never leak onto a later page.
-        if self.seed.as_ref().is_some_and(|(first, _)| *first == first_block) {
-            self.excl.extend(self.seed.as_ref().map(|(_, z)| z.clone()).unwrap_or_default());
+        // A page redo's pre-seeded zones (#1158): the page at `target` lays out with them known
+        // from the start. `pages.len()` is the index of the page about to be pushed, so a block
+        // that spans several pages seeds the one the redo meant, not merely the first it makes.
+        if let Some((target, zones)) = self.seed.take() {
+            let page = self.pages.len();
+            if target == page {
+                self.excl.extend(zones);
+            } else if target > page {
+                self.seed = Some((target, zones));
+            }
         }
-        self.seed = None;
         self.float_tables.clear();
         if self.sect.line_numbers.as_ref().is_some_and(|l| l.restart == wordcraft_doc::section::LineNumberRestart::Page) {
             self.line_no = 0;
@@ -2439,8 +2443,13 @@ fn layout_pass(
         let mut page_start: Option<(Snap, usize)> = Some((Snap::take(&mut pb, &ctx), block));
         // (page, replays used): a replay converges, but never loop forever.
         let mut wrap_redo: (usize, u8) = (usize::MAX, 0);
-        // Zones that triggered replays on this page, accumulated for pre-seeding.
-        let mut wrap_seed: Vec<WrapArea> = Vec::new();
+        // Zones that triggered replays on the page being redone, by triggering block, so a
+        // replay that moves an anchor replaces that block's zone instead of keeping both. Cleared
+        // when the redo moves to another page, so a page never wraps around the last one's shapes.
+        let mut wrap_seed: Vec<(usize, Vec<WrapArea>)> = Vec::new();
+        // Boxes counted in `ctx.boxes` up to the last replay: everything laid out since then is
+        // thrown away, so it is discounted from the text-box count like a balance pass.
+        let mut redo_boxes_mark = 0usize;
         // A replay restarts the flow, so column balancing (which replays too) sits this
         // section out rather than replaying a stale state.
         let mut wrap_redo_fired = false;
@@ -2462,30 +2471,49 @@ fn layout_pass(
                 // A fresh page began during this block: replaying starts here.
                 page_start = pre.map(|s| (s, block));
             }
+            let first = page_start.as_ref().map_or(block, |(_, f)| *f);
             if multicol
                 && pb.excl.len() > excl_before
                 && let Some(page) = pb.pages.last()
-                && zone_hits_earlier(page, &pb.excl[excl_before..], block)
+                && zone_hits_earlier(page, &pb.excl[excl_before..], first, block)
             {
                 let pi = pb.pages.len() - 1;
                 if wrap_redo.0 != pi {
                     wrap_redo = (pi, 0);
+                    wrap_seed.clear();
                 }
                 if wrap_redo.1 < MAX_WRAP_REDOS
-                    && let Some((snap, first)) = page_start.as_ref()
-                    && let Some(fb) = pb.pages.get(pi).map(|p| p.first_block)
+                    && let Some((snap, start)) = page_start.as_ref()
                 {
                     wrap_redo.1 += 1;
                     wrap_redo_fired = true;
-                    wrap_seed.extend(pb.excl[excl_before..].iter().cloned());
-                    let first = *first;
+                    let zones = pb.excl[excl_before..].to_vec();
+                    if let Some(e) = wrap_seed.iter_mut().find(|(b, _)| *b == block) {
+                        e.1 = zones;
+                    } else {
+                        wrap_seed.push((block, zones));
+                    }
+                    let seed: Vec<WrapArea> = wrap_seed.iter().flat_map(|(_, z)| z.iter().cloned()).collect();
+                    // Boxes laid out since the snapshot is thrown away with the pages after it;
+                    // boxes a later snapshot keeps (laid out since the last replay) are not.
+                    let since = if snap.boxes >= redo_boxes_mark {
+                        ctx.boxes.total().saturating_sub(snap.boxes)
+                    } else {
+                        ctx.boxes.total().saturating_sub(redo_boxes_mark)
+                    };
+                    boxes_discarded += since;
+                    redo_boxes_mark = ctx.boxes.total();
+                    let start = *start;
                     snap.restore(&mut pb, &mut ctx);
-                    // The redone page usually already exists after the restore: seed it now.
-                    // If the replay overflows and recreates it, `new_page` applies the seed
-                    // again from the field (one-shot, first-block match).
-                    pb.excl.extend(wrap_seed.clone());
-                    pb.seed = Some((fb, wrap_seed.clone()));
-                    block = first;
+                    // The snapshot may already be on the target page (the section or a column
+                    // break started it): seed it now. Else it is laid out later, when `new_page`
+                    // reaches page `pi`.
+                    if pb.pages.len() == pi + 1 {
+                        pb.excl.extend(seed);
+                    } else {
+                        pb.seed = Some((pi, seed));
+                    }
+                    block = start;
                     continue;
                 }
             }
@@ -3058,23 +3086,28 @@ fn rel_exclusions(excl: &[WrapArea], x0: f32, y0: f32) -> Vec<para::Exclusion> {
         .collect()
 }
 
-/// Whether any of `zones` (wrap areas just added by block `block`) overlaps lines already on
-/// `page` from other top-level blocks: earlier content laid out before the zones existed, so it
-/// runs through them (#1158). Turned lines are left out; touching edges don't count.
-fn zone_hits_earlier(page: &Page, zones: &[WrapArea], block: usize) -> bool {
+/// Whether any of `zones` (wrap areas just added by block `block`) overlaps body lines placed on
+/// `page` by the blocks the replay starts at or after and before `block`: earlier content laid
+/// out before the zones existed, so it runs through them (#1158). Lines of another story (a text
+/// box, a note), of a block the replay cannot move (one before `first`, in an earlier section or
+/// the page before), and turned lines are left out; touching edges don't count.
+fn zone_hits_earlier(page: &Page, zones: &[WrapArea], first: usize, block: usize) -> bool {
     let fresh: Vec<Rect> = zones.iter().map(|z| z.0.expand(-0.5)).collect();
     if fresh.is_empty() {
         return false;
     }
     for it in &page.items {
-        let Placed::Lines { path, x, y, para, l0, l1, turn: TextDirection::Horizontal, .. } = it else { continue };
-        if path.0.first() == Some(&(block as u32)) {
+        let Placed::Lines { story: StoryRef::Body, path, x, y, para, l0, l1, turn: TextDirection::Horizontal, .. } = it else {
+            continue;
+        };
+        let Some(&top) = path.0.first() else { continue };
+        if (top as usize) < first || (top as usize) >= block {
             continue;
         }
-        let Some(first) = para.lines.get(*l0) else { continue };
+        let Some(head) = para.lines.get(*l0) else { continue };
         for li in *l0..*l1 {
             let Some(ln) = para.lines.get(li) else { continue };
-            let band = Rect::new(x + ln.left, y + (ln.top - first.top), (ln.right - ln.left).max(0.0), ln.height);
+            let band = Rect::new(x + ln.left, y + (ln.top - head.top), (ln.right - ln.left).max(0.0), ln.height);
             if fresh.iter().any(|z| z.intersects(&band)) {
                 return true;
             }

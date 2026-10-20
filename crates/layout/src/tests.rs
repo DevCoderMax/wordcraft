@@ -3501,25 +3501,161 @@ fn earlier_column_wraps_around_shape_anchored_in_later_column() {
             for li in *l0..*l1 {
                 let ln = &para.lines[li];
                 let (top, bottom) = (y + (ln.top - first.top), y + (ln.top - first.top) + ln.height);
-                if bottom > r.y && top < r.bottom() {
-                    let mut span: Option<(f32, f32)> = None;
-                    for k in ln.c0..ln.c1 {
-                        let Some(c) = para.clusters.get(k) else { continue };
-                        if c.kind == para::ClKind::Space {
-                            continue;
-                        }
-                        let (a, b) = (ln.xs.get(k - ln.c0).copied().unwrap_or(0.0), ln.xs.get(k - ln.c0).copied().unwrap_or(0.0) + c.adv);
-                        span = Some((span.map_or(a, |s: (f32, f32)| s.0.min(a)), span.map_or(b, |s| s.1.max(b))));
-                    }
-                    if let Some((a, b)) = span {
-                        assert!(!(x + a < r.right() - 0.5 && x + b > r.x + 0.5), "line must not run through the shape");
-                        narrowed += 1;
-                    }
+                if bottom > r.y
+                    && top < r.bottom()
+                    && let Some((a, b)) = line_span(para, ln)
+                {
+                    assert!(!(x + a < r.right() - 0.5 && x + b > r.x + 0.5), "line must not run through the shape");
+                    narrowed += 1;
                 }
             }
         }
     }
     assert!(narrowed >= 2, "several column-1 lines overlap the shape");
+}
+
+/// #1158: a replay seeds the page the anchor is on, even when the block it replays spans more
+/// pages than the one that needs the zones.
+#[test]
+fn a_replay_seeds_the_anchored_page_when_its_block_spans_pages() {
+    use wordcraft_doc::para::{Anchor, Float, ShapeKind, Wrap};
+    // One paragraph running over two page breaks in two columns, then the anchor paragraph.
+    let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(240);
+    let mut d = Document::from_text(&(long + "\nAnchor paragraph."));
+    d.last_section.columns.count = 2;
+    // A square-wrapped shape anchored at the start of the anchor paragraph, over column 1.
+    let shape = InlineObject::Shape {
+        kind: ShapeKind::Rectangle,
+        w: 100.0,
+        h: 80.0,
+        fill: None,
+        stroke: None,
+        stroke_width: 1.0,
+        float: Float { wrap: Wrap::Square, h_rel: Anchor::Margin, v_rel: Anchor::Paragraph, x: 0.0, y: 0.0, dist: 9.0, ..Default::default() },
+        story: None,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
+    };
+    d.insert_object(&Pos { story: StoryRef::Body, path: Path::top(1), off: 0 }, shape, &Default::default()).unwrap();
+    let l = lay(&d);
+    let hit = l.find_object(0, |o| o.text_box.is_none()).expect("shape");
+    let page = hit.page;
+    assert!(page >= 2, "the anchor is on a later page, on {page}");
+    let r = hit.rect;
+    let body = l.pages[page].body;
+    let mid = body.x + body.w / 2.0;
+    assert!(r.right() < mid, "shape over column 1: {r:?}");
+    // Lines the long paragraph continues on that page, before the anchor, wrap around it.
+    let mut narrowed = 0;
+    for it in &l.pages[page].items {
+        if let Placed::Lines { story: StoryRef::Body, path, para, l0, l1, x, y, .. } = it
+            && *path == Path::top(0)
+            && *x < mid
+        {
+            let head = &para.lines[*l0];
+            for li in *l0..*l1 {
+                let ln = &para.lines[li];
+                let (top, bottom) = (y + (ln.top - head.top), y + (ln.top - head.top) + ln.height);
+                if bottom > r.y
+                    && top < r.bottom()
+                    && let Some((a, b)) = line_span(para, ln)
+                {
+                    assert!(!(x + a < r.right() - 0.5 && x + b > r.x + 0.5), "line must not run through the shape");
+                    narrowed += 1;
+                }
+            }
+        }
+    }
+    assert!(narrowed >= 2, "several continued lines overlap the shape");
+}
+
+/// #1158: the zones that seed one page's replay stay on that page. Two pages with a shape over
+/// column 1 must not wrap the second page's text around the first page's wider shape.
+#[test]
+fn a_replay_does_not_seed_the_next_page_with_the_previous_pages_zones() {
+    use wordcraft_doc::para::{Anchor, Float, ShapeKind, Wrap};
+    // Page 1: column 1, a column break, column 2; a page break after column 2. Page 2 likewise.
+    let mut text = String::new();
+    for i in 0..8 {
+        text.push_str(&format!("Page one column one, line {i}.\n"));
+    }
+    text.push_str(&format!("End of the first column.{}\n", wordcraft_doc::para::COLUMN_BREAK));
+    for i in 0..5 {
+        text.push_str(&format!("Page one column two, line {i}.\n"));
+    }
+    text.push_str(&format!("End of the first page.{}\n", wordcraft_doc::para::PAGE_BREAK));
+    for i in 0..8 {
+        text.push_str(&format!("Page two column one, line {i}.\n"));
+    }
+    text.push_str(&format!("End of the second column.{}\n", wordcraft_doc::para::COLUMN_BREAK));
+    text.push_str("Page two column two.\n");
+    let mut d = Document::from_text(&text);
+    d.last_section.columns.count = 2;
+    // Wide on page 1, narrow on page 2: a leaked page-1 zone would leave page 2's text a gap
+    // as wide as the first shape, beyond the narrow one actually there.
+    let wide = 150.0;
+    let narrow = 60.0;
+    for (block, w) in [(9, wide), (24, narrow)] {
+        let shape = InlineObject::Shape {
+            kind: ShapeKind::Rectangle,
+            w,
+            h: 80.0,
+            fill: None,
+            stroke: None,
+            stroke_width: 1.0,
+            float: Float { wrap: Wrap::Square, h_rel: Anchor::Margin, v_rel: Anchor::Paragraph, x: 0.0, y: 0.0, dist: 9.0, ..Default::default() },
+            story: None,
+            freeform: None,
+            effects: Default::default(),
+            extra: Default::default(),
+        };
+        d.insert_object(&Pos { story: StoryRef::Body, path: Path::top(block), off: 0 }, shape, &Default::default()).unwrap();
+    }
+    let l = lay(&d);
+    let first = l.find_object(0, |o| (o.rect.w - wide).abs() < 0.5).expect("wide shape");
+    let second = l.find_object(0, |o| (o.rect.w - narrow).abs() < 0.5).expect("narrow shape");
+    assert_eq!(first.page, 0, "wide shape on page 1");
+    assert_eq!(second.page, 1, "narrow shape on page 2");
+    let r = second.rect;
+    let body = l.pages[1].body;
+    let mid = body.x + body.w / 2.0;
+    // Lines beside the narrow shape start right after it, not after the wide shape's edge.
+    let mut beside = 0;
+    for it in &l.pages[1].items {
+        if let Placed::Lines { story: StoryRef::Body, para, l0, l1, x, y, .. } = it
+            && *x < mid
+        {
+            let head = &para.lines[*l0];
+            for li in *l0..*l1 {
+                let ln = &para.lines[li];
+                let (top, bottom) = (y + (ln.top - head.top), y + (ln.top - head.top) + ln.height);
+                if bottom > r.y && top < r.bottom() {
+                    if let Some((a, _)) = line_span(para, ln) {
+                        assert!(x + a > r.right() + 8.0, "line beside the narrow shape: {ln:?}");
+                        assert!(x + a < r.right() + 20.0, "the previous page's wide zone leaked");
+                        beside += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(beside >= 2, "several page-2 lines overlap the narrow shape");
+}
+
+/// The horizontal span (left, right) of a line's non-space clusters, relative to the column.
+fn line_span(pl: &ParaLayout, ln: &para::Line) -> Option<(f32, f32)> {
+    let mut span: Option<(f32, f32)> = None;
+    for k in ln.c0..ln.c1 {
+        let Some(c) = pl.clusters.get(k) else { continue };
+        if c.kind == para::ClKind::Space {
+            continue;
+        }
+        let a = ln.xs.get(k - ln.c0).copied().unwrap_or(0.0);
+        let b = a + c.adv;
+        span = Some((span.map_or(a, |s: (f32, f32)| s.0.min(a)), span.map_or(b, |s| s.1.max(b))));
+    }
+    span
 }
 
 /// Where a line's text ends (its last non-space cluster's right edge; trailing spaces may hang
