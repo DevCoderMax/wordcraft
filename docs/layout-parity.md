@@ -330,10 +330,10 @@ Page-relative footer tables keep their physical wrap bounds without adding to fo
 | 2026-10-10 | trivial | AutoFit Contents measures the text (#44) |
 | 2026-10-10 | major | First version: layout and pagination checklist with evidence from `crates/layout`, PRs and issues |
 | 2026-10-16 | trivial | OpenType ligatures follow `w14:ligatures` (none, standard, contextual, historical, discretional and their combinations); without it WordCraft's default stays |
+| 2026-10-20 | trivial | Text in an earlier column wraps around a shape anchored in a later one; the page is laid out again with the anchor's zones known from its start, and a replay's zones stay on its own page and follow a moved anchor (#1158) |
 
 Maintenance on 2026-10-12 retains current tracked-deletion, endnote, footer-total, text-box
 and balloon layout while supplying explicit cell identity at every box call. The native Word
 probes above are historical; this rebase has no new native or other-platform measurement.
 
 Repeated table-cell control, 12 October 2026: four same-style contextual paragraphs with 6 pt before/after and exactly 24 pt lines retain zero extra gap at every boundary. The body control uses the same fixture. This is an original specification-based regression; no new native Word table comparison was run.
-| 2026-10-20 | trivial | Text in an earlier column wraps around a shape anchored in a later one; the page is laid out again with the anchor's zones known from its start, and a replay's zones stay on its own page and follow a moved anchor (#1158) |
