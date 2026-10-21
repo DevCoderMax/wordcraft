@@ -1603,6 +1603,9 @@ struct PageBuilder<'a> {
     /// index lays out with them known from the start. A seed for a page not reached yet stays
     /// for it; one whose page has passed is dropped. Empty in normal flow.
     seed: Option<(usize, Vec<WrapArea>)>,
+    /// Wrap areas of each page finished inside the current block, with its index, so an anchor
+    /// that crosses a page can still replay the page it started on (#1158).
+    cleared_wraps: Vec<(usize, Vec<WrapArea>)>,
     /// Wrap areas of the floating tables on this page, which others may not overlap.
     float_tables: Vec<Rect>,
     /// Line numbering counter.
@@ -2030,6 +2033,11 @@ impl PageBuilder<'_> {
         self.apply_valign();
         self.flush_notes();
         self.beneath = self.sect_beneath;
+        if !self.excl.is_empty()
+            && let Some(page) = self.pages.len().checked_sub(1)
+        {
+            self.cleared_wraps.push((page, self.excl.clone()));
+        }
         self.excl.clear();
         // A page redo's pre-seeded zones (#1158): the page at `target` lays out with them known
         // from the start. `pages.len()` is the index of the page about to be pushed, so a block
@@ -2300,6 +2308,7 @@ fn layout_pass(
         restart_at: None,
         excl: Vec::new(),
         seed: None,
+        cleared_wraps: Vec::new(),
         float_tables: Vec::new(),
         line_no: 0,
         page_items_start: 0,
@@ -2460,6 +2469,7 @@ fn layout_pass(
             let multicol = pb.cols.len() > 1;
             let pre = multicol.then(|| Snap::take(&mut pb, &ctx));
             let (excl_before, pages_before) = (pb.excl.len(), pb.pages.len());
+            pb.cleared_wraps.clear();
             pb.mark_block();
             match (&**b, &outline) {
                 (Block::Para(p), Some(o)) => place_outline_para(&mut ctx, &mut pb, p, block, o),
@@ -2467,27 +2477,39 @@ fn layout_pass(
                 (Block::Para(p), None) => place_para(&mut ctx, &mut pb, p, block, body_top),
                 (Block::Table(t), _) => place_table(&mut ctx, &mut pb, t, block, body_top),
             }
-            if pb.pages.len() != pages_before {
-                // A fresh page began during this block: replaying starts here.
-                page_start = pre.map(|s| (s, block));
-            }
-            let first = page_start.as_ref().map_or(block, |(_, f)| *f);
-            if multicol
+            let crossed = pb.pages.len() != pages_before;
+            // Keep the snapshot of the page the block started on: if the block crosses a page,
+            // its anchor may still have moved over lines already placed there (#1158).
+            let old_page_start = if crossed { page_start.take() } else { None };
+            let earlier = if multicol && crossed {
+                pages_before.checked_sub(1).and_then(|page| {
+                    let zones =
+                        pb.cleared_wraps.iter().find_map(|(p, z)| (*p == page && z.len() > excl_before).then(|| z[excl_before..].to_vec()))?;
+                    let (snap, start) = old_page_start.as_ref()?;
+                    zone_hits_earlier(&pb.pages[page], &zones, *start, block).then_some((page, snap, *start, zones, true))
+                })
+            } else {
+                None
+            };
+            let here = if multicol
+                && !crossed
                 && pb.excl.len() > excl_before
                 && let Some(page) = pb.pages.last()
-                && zone_hits_earlier(page, &pb.excl[excl_before..], first, block)
+                && let Some((snap, start)) = page_start.as_ref()
+                && zone_hits_earlier(page, &pb.excl[excl_before..], *start, block)
             {
-                let pi = pb.pages.len() - 1;
+                Some((pb.pages.len() - 1, snap, *start, pb.excl[excl_before..].to_vec(), false))
+            } else {
+                None
+            };
+            if let Some((pi, snap, start, zones, from_earlier)) = earlier.or(here) {
                 if wrap_redo.0 != pi {
                     wrap_redo = (pi, 0);
                     wrap_seed.clear();
                 }
-                if wrap_redo.1 < MAX_WRAP_REDOS
-                    && let Some((snap, start)) = page_start.as_ref()
-                {
+                if wrap_redo.1 < MAX_WRAP_REDOS {
                     wrap_redo.1 += 1;
                     wrap_redo_fired = true;
-                    let zones = pb.excl[excl_before..].to_vec();
                     if let Some(e) = wrap_seed.iter_mut().find(|(b, _)| *b == block) {
                         e.1 = zones;
                     } else {
@@ -2503,7 +2525,6 @@ fn layout_pass(
                     };
                     boxes_discarded += since;
                     redo_boxes_mark = ctx.boxes.total();
-                    let start = *start;
                     snap.restore(&mut pb, &mut ctx);
                     // The snapshot may already be on the target page (the section or a column
                     // break started it): seed it now. Else it is laid out later, when `new_page`
@@ -2513,9 +2534,16 @@ fn layout_pass(
                     } else {
                         pb.seed = Some((pi, seed));
                     }
+                    if from_earlier {
+                        page_start = old_page_start;
+                    }
                     block = start;
                     continue;
                 }
+            }
+            if crossed {
+                // A fresh page began during this block: replaying starts here.
+                page_start = pre.map(|s| (s, block));
             }
             if let Some((pages, snap)) = before
                 && pb.pages.len() != pages

@@ -3570,6 +3570,63 @@ fn a_replay_seeds_the_anchored_page_when_its_block_spans_pages() {
     assert!(narrowed >= 2, "several continued lines overlap the shape");
 }
 
+/// #1158: an anchor paragraph that itself crosses a page still wraps the text already placed
+/// on the page where it started, not just the page it ends on.
+#[test]
+fn an_anchor_block_that_crosses_a_page_wraps_the_earlier_page() {
+    use wordcraft_doc::para::{Anchor, Float, ShapeKind, Wrap};
+    // Column 1 holds eight lines; a column break sends a long, anchored paragraph to column 2,
+    // from where it runs over a page break.
+    let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(240);
+    let mut text = "Column one line.\n".repeat(8);
+    text.push_str(&format!("End of the first column.{}\n", wordcraft_doc::para::COLUMN_BREAK));
+    text.push_str(&long);
+    let mut d = Document::from_text(&text);
+    d.last_section.columns.count = 2;
+    let shape = InlineObject::Shape {
+        kind: ShapeKind::Rectangle,
+        w: 100.0,
+        h: 80.0,
+        fill: None,
+        stroke: None,
+        stroke_width: 1.0,
+        float: Float { wrap: Wrap::Square, h_rel: Anchor::Margin, v_rel: Anchor::Paragraph, x: 0.0, y: 0.0, dist: 9.0, ..Default::default() },
+        story: None,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
+    };
+    d.insert_object(&Pos { story: StoryRef::Body, path: Path::top(9), off: 0 }, shape, &Default::default()).unwrap();
+    let l = lay(&d);
+    assert!(l.pages.len() >= 2, "the anchor block spans a page");
+    let hit = l.find_object(0, |o| o.text_box.is_none()).expect("shape");
+    assert_eq!(hit.page, 0, "shape on the page where the anchor block starts");
+    let r = hit.rect;
+    let body = l.pages[0].body;
+    let mid = body.x + body.w / 2.0;
+    assert!(r.right() < mid, "shape over column 1: {r:?}");
+    let mut narrowed = 0;
+    for it in &l.pages[0].items {
+        if let Placed::Lines { story: StoryRef::Body, para, l0, l1, x, y, .. } = it
+            && *x < mid
+        {
+            let head = &para.lines[*l0];
+            for li in *l0..*l1 {
+                let ln = &para.lines[li];
+                let (top, bottom) = (y + (ln.top - head.top), y + (ln.top - head.top) + ln.height);
+                if bottom > r.y
+                    && top < r.bottom()
+                    && let Some((a, b)) = line_span(para, ln)
+                {
+                    assert!(!(x + a < r.right() - 0.5 && x + b > r.x + 0.5), "line must not run through the shape");
+                    narrowed += 1;
+                }
+            }
+        }
+    }
+    assert!(narrowed >= 2, "several first-page lines overlap the shape");
+}
+
 /// #1158: the zones that seed one page's replay stay on that page. Two pages with a shape over
 /// column 1 must not wrap the second page's text around the first page's wider shape.
 #[test]
@@ -3630,12 +3687,13 @@ fn a_replay_does_not_seed_the_next_page_with_the_previous_pages_zones() {
             for li in *l0..*l1 {
                 let ln = &para.lines[li];
                 let (top, bottom) = (y + (ln.top - head.top), y + (ln.top - head.top) + ln.height);
-                if bottom > r.y && top < r.bottom() {
-                    if let Some((a, _)) = line_span(para, ln) {
-                        assert!(x + a > r.right() + 8.0, "line beside the narrow shape: {ln:?}");
-                        assert!(x + a < r.right() + 20.0, "the previous page's wide zone leaked");
-                        beside += 1;
-                    }
+                if bottom > r.y
+                    && top < r.bottom()
+                    && let Some((a, _)) = line_span(para, ln)
+                {
+                    assert!(x + a > r.right() + 8.0, "line beside the narrow shape: {ln:?}");
+                    assert!(x + a < r.right() + 20.0, "the previous page's wide zone leaked");
+                    beside += 1;
                 }
             }
         }
