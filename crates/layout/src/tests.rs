@@ -3627,6 +3627,71 @@ fn an_anchor_block_that_crosses_a_page_wraps_the_earlier_page() {
     assert!(narrowed >= 2, "several first-page lines overlap the shape");
 }
 
+/// #1158: an anchor paragraph with keep_lines that moves whole to page 2 must not leave
+/// an abandoned wrap zone behind that narrows column 1 on page 1.
+#[test]
+fn an_abandoned_anchor_placement_does_not_replay_or_narrow_the_earlier_page() {
+    use wordcraft_doc::para::{Anchor, Float, ShapeKind, Wrap};
+    // Column 1 holds eight lines; a column break sends flow to column 2.
+    // Column 2 fills with enough lines so that an anchor paragraph with keep_lines cannot fit
+    // and must move whole to page 2.
+    let mut text = String::new();
+    for i in 0..8 {
+        text.push_str(&format!("Column one line {i}.\n"));
+    }
+    text.push_str(&format!("End of column one.{}\n", wordcraft_doc::para::COLUMN_BREAK));
+    for i in 0..38 {
+        text.push_str(&format!("Column two line {i}.\n"));
+    }
+    let long_anchor = "alpha beta gamma delta epsilon zeta eta theta iota kappa ".repeat(20);
+    text.push_str(&long_anchor);
+    let mut d = Document::from_text(&text);
+    d.last_section.columns.count = 2;
+    // Paragraph 0..8: col 1
+    // Paragraph 8: "End of column one..."
+    // Paragraph 9..47: col 2 (38 paragraphs)
+    // Paragraph 47: kept anchor block
+    let anchor_block = 47;
+    d.para_mut(StoryRef::Body, &Path::top(anchor_block)).unwrap().props.keep_lines = Some(true);
+    let shape = InlineObject::Shape {
+        kind: ShapeKind::Rectangle,
+        w: 100.0,
+        h: 80.0,
+        fill: None,
+        stroke: None,
+        stroke_width: 1.0,
+        float: Float { wrap: Wrap::Square, h_rel: Anchor::Margin, v_rel: Anchor::Paragraph, x: 0.0, y: 0.0, dist: 9.0, ..Default::default() },
+        story: None,
+        freeform: None,
+        effects: Default::default(),
+        extra: Default::default(),
+    };
+    d.insert_object(&Pos { story: StoryRef::Body, path: Path::top(anchor_block), off: 0 }, shape, &Default::default()).unwrap();
+    let l = lay(&d);
+    assert!(l.pages.len() >= 2, "layout has at least two pages");
+    let hit = l.find_object(0, |o| o.text_box.is_none()).expect("shape placed");
+    assert_eq!(hit.page, 1, "shape moved to page 2 with its kept paragraph");
+    let body = l.pages[0].body;
+    let mid = body.x + body.w / 2.0;
+    // On page 1, column 1's lines must not have been narrowed by any phantom wrap zone
+    let mut checked = 0;
+    for it in &l.pages[0].items {
+        if let Placed::Lines { story: StoryRef::Body, para, l0, l1, x, .. } = it
+            && *x < mid
+        {
+            for li in *l0..*l1 {
+                let ln = &para.lines[li];
+                if let Some((a, b)) = line_span(para, ln) {
+                    assert!(x + a < body.x + 1.0, "line left margin must not be indented by a phantom wrap");
+                    assert!(b - a > 50.0, "column 1 line must stay full width");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked >= 8, "all column 1 lines on page 1 checked");
+}
+
 /// #1158: the zones that seed one page's replay stay on that page. Two pages with a shape over
 /// column 1 must not wrap the second page's text around the first page's wider shape.
 #[test]

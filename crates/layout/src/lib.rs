@@ -2481,16 +2481,26 @@ fn layout_pass(
             // Keep the snapshot of the page the block started on: if the block crosses a page,
             // its anchor may still have moved over lines already placed there (#1158).
             let old_page_start = if crossed { page_start.take() } else { None };
-            let earlier = if multicol && crossed {
-                pages_before.checked_sub(1).and_then(|page| {
-                    let zones =
-                        pb.cleared_wraps.iter().find_map(|(p, z)| (*p == page && z.len() > excl_before).then(|| z[excl_before..].to_vec()))?;
-                    let (snap, start) = old_page_start.as_ref()?;
-                    zone_hits_earlier(&pb.pages[page], &zones, *start, block).then_some((page, snap, *start, zones, true))
-                })
-            } else {
-                None
-            };
+            let earlier =
+                if multicol && crossed {
+                    pages_before.checked_sub(1).and_then(|page| {
+                        // The anchor's floats must have stayed on that page: a paragraph that moved on
+                        // whole leaves only the zones of an abandoned placement in `cleared_wraps`.
+                        let anchored_here =
+                            pb.pages.get(page)?.items.iter().any(
+                                |it| matches!(it, Placed::Object { story: StoryRef::Body, path, .. } if path.0.first() == Some(&(block as u32))),
+                            );
+                        if !anchored_here {
+                            return None;
+                        }
+                        let zones =
+                            pb.cleared_wraps.iter().find_map(|(p, z)| (*p == page && z.len() > excl_before).then(|| z[excl_before..].to_vec()))?;
+                        let (snap, start) = old_page_start.as_ref()?;
+                        zone_hits_earlier(&pb.pages[page], &zones, *start, block).then_some((page, snap, *start, zones, true))
+                    })
+                } else {
+                    None
+                };
             let here = if multicol
                 && !crossed
                 && pb.excl.len() > excl_before
